@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@aave/core-v3/contracts/flashloan/base/FlashLoanReceiverBase.sol";
+import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+
+contract CrossExchangeArbitrage is FlashLoanReceiverBase, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    address private owner;
+    address private withdrawalWallet;
+    address private authorizedBot;
+
+    uint256 public targetProfit = 1 ether;
+    uint256 public slippageLimit = 50; // 0.5% slippage
+    uint256 public maxLossPercentage = 5; // 5% max loss acceptable
+
+    address private constant WETH = 0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619;
+    address private constant DAI = 0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063;
+
+    IUniswapV2Router02 private uniswapRouter;
+    IUniswapV2Router02 private sushiswapRouter;
+    address[] private uniswapPath;
+    address[] private sushiswapPath;
+
+    event ArbitrageExecuted(uint256 profit, uint256 initialWETH, uint256 finalWETH);
+    event ProfitWithdrawn(uint256 amount);
+    event TargetProfitUpdated(uint256 newTargetProfit);
+    event SlippageLimitUpdated(uint256 newSlippageLimit);
+    event WithdrawalWalletUpdated(address newWallet);
+    event AuthorizedBotUpdated(address newBot);
+
+    constructor(
+        IPoolAddressesProvider _provider,
+        address _withdrawalWallet,
+        address _uniswapRouter,
+        address _sushiswapRouter
+    ) FlashLoanReceiverBase(_provider) {
+        owner = msg.sender;
+        withdrawalWallet = _withdrawalWallet;
+        uniswapRouter = IUniswapV2Router02(_uniswapRouter);
+        sushiswapRouter = IUniswapV2Router02(_sushiswapRouter);
+    }
+
+    receive() external payable {
+        require(msg.sender == address(0xYourKnownAddress), "Unauthorized sender");
+    }
+
+    fallback() external payable {
+        require(msg.sender == address(0xYourKnownAddress), "Unauthorized sender");
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not the owner");
+        _;
+    }
+
+    modifier onlyAuthorized() {
+        require(msg.sender == owner || msg.sender == authorizedBot, "Not authorized");
+        _;
+    }
+
+    function executeArbitrage() external onlyAuthorized nonReentrant {
+        uint256 amountToBorrow = 323 ether;
+        address asset = WETH;
+        bytes memory params = "";
+        uint16 referralCode = 0;
+
+        POOL.flashLoanSimple(
+            address(this),
+            asset,
+            amountToBorrow,
+            params,
+            referralCode
+        );
+    }
+
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 fee,
+        bytes calldata params
+    ) external override returns (bool) {
+        require(asset == WETH, "Asset mismatch");
+        uint256 amountToRepay = amount + fee;
+
+        uint256 initialWETHBalance = IERC20(WETH).balanceOf(address(this));
+
+        // Swap WETH for DAI on Uniswap
+        uniswapPath = [WETH, DAI];
+        approveTokensOnce(WETH, address(uniswapRouter));
+        uniswapRouter.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            amount,
+            (amount * (10000 - slippageLimit)) / 10000,
+            uniswapPath,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 tradedDAIAmount = IERC20(DAI).balanceOf(address(this));
+
+        // Swap DAI for WETH on Sushiswap
+        sushiswapPath = [DAI, WETH];
+        approveTokensOnce(DAI, address(sushiswapRouter));
+        sushiswapRouter.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            tradedDAIAmount,
+            (tradedDAIAmount * (10000 - slippageLimit)) / 10000,
+            sushiswapPath,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 finalWETHBalance = IERC20(WETH).balanceOf(address(this));
+        require(finalWETHBalance >= initialWETHBalance + targetProfit, "Arbitrage: Not profitable");
+        require(finalWETHBalance >= amountToRepay, "Arbitrage: Insufficient balance to repay flashloan");
+
+        uint256 minimumExpectedBalance = initialWETHBalance - (initialWETHBalance * maxLossPercentage) / 100;
+        require(finalWETHBalance >= minimumExpectedBalance, "Arbitrage: Slippage too high");
+
+        IERC20(WETH).safeApprove(address(POOL), amountToRepay);
+
+        emit ArbitrageExecuted(finalWETHBalance - initialWETHBalance, initialWETHBalance, finalWETHBalance);
+
+        _withdrawProfits();
+
+        return true;
+    }
+
+    function _withdrawProfits() internal {
+        uint256 balance = IERC20(WETH).balanceOf(address(this));
+        if (balance > 0) {
+            IERC20(WETH).safeTransfer(withdrawalWallet, balance);
+            emit ProfitWithdrawn(balance);
+        }
+    }
+
+    function approveTokensOnce(address token, address spender) internal {
+        uint256 currentAllowance = IERC20(token).allowance(address(this), spender);
+        if (currentAllowance == 0) {
+            IERC20(token).safeApprove(spender, type(uint256).max);
+        }
+    }
+
+    function setTargetProfit(uint256 _newProfit) external onlyOwner {
+        targetProfit = _newProfit;
+        emit TargetProfitUpdated(_newProfit);
+    }
+
+    function setSlippageLimit(uint256 _newSlippageLimit) external onlyOwner {
+        require(_newSlippageLimit <= 10000, "Slippage limit out of range");
+        slippageLimit = _newSlippageLimit;
+        emit SlippageLimitUpdated(_newSlippageLimit);
+    }
+
+    function setWithdrawalWallet(address _newWallet) external onlyOwner {
+        require(_newWallet != address(0), "New wallet is the zero address");
+        withdrawalWallet = _newWallet;
+        emit WithdrawalWalletUpdated(_newWallet);
+    }
+
+    function setAuthorizedBot(address _bot) external onlyOwner {
+        authorizedBot = _bot;
+        emit AuthorizedBotUpdated(_bot);
+    }
+
+    function getBalance() external view returns (uint256) {
+        return IERC20(WETH).balanceOf(address(this));
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "New owner is the zero address");
+        owner = newOwner;
+    }
+
+    function emergencyWithdraw(address token) external onlyOwner {
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        require(balance > 0, "No balance to withdraw");
+        IERC20(token).safeTransfer(owner, balance);
+    }
+
+    function emergencyWithdrawETH() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No balance to withdraw");
+        payable(owner).transfer(balance);
+    }
+}
